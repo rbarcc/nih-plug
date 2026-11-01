@@ -47,6 +47,10 @@ use clap_sys::ext::render::{
 use clap_sys::ext::state::{clap_plugin_state, CLAP_EXT_STATE};
 use clap_sys::ext::tail::{clap_plugin_tail, CLAP_EXT_TAIL};
 use clap_sys::ext::thread_check::{clap_host_thread_check, CLAP_EXT_THREAD_CHECK};
+use clap_sys::ext::track_info::{
+    clap_host_track_info, clap_plugin_track_info, clap_track_info, CLAP_EXT_TRACK_INFO,
+    CLAP_EXT_TRACK_INFO_COMPAT, CLAP_TRACK_INFO_HAS_TRACK_COLOR, CLAP_TRACK_INFO_HAS_TRACK_NAME,
+};
 use clap_sys::ext::voice_info::{
     clap_host_voice_info, clap_plugin_voice_info, clap_voice_info, CLAP_EXT_VOICE_INFO,
     CLAP_VOICE_INFO_SUPPORTS_OVERLAPPING_NOTES,
@@ -234,6 +238,9 @@ pub struct Wrapper<P: ClapPlugin> {
     clap_plugin_state: clap_plugin_state,
 
     clap_plugin_tail: clap_plugin_tail,
+
+    clap_plugin_track_info: clap_plugin_track_info,
+    host_track_info: AtomicRefCell<Option<ClapPtr<clap_host_track_info>>>,
 
     clap_plugin_voice_info: clap_plugin_voice_info,
     host_voice_info: AtomicRefCell<Option<ClapPtr<clap_host_voice_info>>>,
@@ -665,6 +672,11 @@ impl<P: ClapPlugin> Wrapper<P> {
                 get: Some(Self::ext_tail_get),
             },
 
+            clap_plugin_track_info: clap_plugin_track_info {
+                changed: Some(Self::ext_track_info_changed),
+            },
+            host_track_info: AtomicRefCell::new(None),
+
             clap_plugin_voice_info: clap_plugin_voice_info {
                 get: Some(Self::ext_voice_info_get),
             },
@@ -753,6 +765,45 @@ impl<P: ClapPlugin> Wrapper<P> {
             output_events_guard: self.output_events.borrow_mut(),
             transport,
         }
+    }
+
+    /// Ask the host what track the plugin is on and hand the answer to the plugin. Main thread
+    /// only. Does nothing if the host has no `track-info`, or has nothing to say.
+    fn update_track_info(&self) {
+        let host_track_info = self.host_track_info.borrow();
+        let Some(host_track_info) = &*host_track_info else {
+            return;
+        };
+
+        // SAFETY: an all-zero `clap_track_info` is valid: no flags, an empty name and a null port
+        // type, which is never read.
+        let mut info: clap_track_info = unsafe { std::mem::zeroed() };
+        let got = unsafe_clap_call! { host_track_info=>get(&*self.host_callback, &mut info) };
+        if !got {
+            return;
+        }
+
+        let name = (info.flags & CLAP_TRACK_INFO_HAS_TRACK_NAME != 0).then(|| {
+            // The host should have terminated it, but it is not trusted to have.
+            if let Some(last) = info.name.last_mut() {
+                *last = 0;
+            }
+            unsafe { CStr::from_ptr(info.name.as_ptr()) }
+                .to_string_lossy()
+                .into_owned()
+        });
+        let color = (info.flags & CLAP_TRACK_INFO_HAS_TRACK_COLOR != 0).then_some([
+            info.color.red,
+            info.color.green,
+            info.color.blue,
+        ]);
+        let track_info = crate::plugin::TrackInfo {
+            name,
+            color,
+            index: None,
+        };
+        nih_trace!("Host reports track info {track_info:?}");
+        self.plugin.lock().track_info_changed(&track_info);
     }
 
     /// Get a parameter's ID based on a `ParamPtr`. Used in the `GuiContext` implementation for the
@@ -1855,6 +1906,19 @@ impl<P: ClapPlugin> Wrapper<P> {
             &wrapper.host_callback,
             CLAP_EXT_THREAD_CHECK,
         );
+        // Hosts that implemented the draft only answer to its id.
+        *wrapper.host_track_info.borrow_mut() = query_host_extension::<clap_host_track_info>(
+            &wrapper.host_callback,
+            CLAP_EXT_TRACK_INFO,
+        )
+        .or_else(|| {
+            query_host_extension::<clap_host_track_info>(
+                &wrapper.host_callback,
+                CLAP_EXT_TRACK_INFO_COMPAT,
+            )
+        });
+        // The host only calls `changed` when something changes, so the first answer is asked for.
+        wrapper.update_track_info();
 
         true
     }
@@ -2335,6 +2399,8 @@ impl<P: ClapPlugin> Wrapper<P> {
             &wrapper.clap_plugin_state as *const _ as *const c_void
         } else if id == CLAP_EXT_TAIL {
             &wrapper.clap_plugin_tail as *const _ as *const c_void
+        } else if id == CLAP_EXT_TRACK_INFO || id == CLAP_EXT_TRACK_INFO_COMPAT {
+            &wrapper.clap_plugin_track_info as *const _ as *const c_void
         } else if id == CLAP_EXT_VOICE_INFO && P::CLAP_POLY_MODULATION_CONFIG.is_some() {
             &wrapper.clap_plugin_voice_info as *const _ as *const c_void
         } else {
@@ -3184,6 +3250,13 @@ impl<P: ClapPlugin> Wrapper<P> {
             ProcessStatus::KeepAlive => u32::MAX,
             _ => 0,
         }
+    }
+
+    unsafe extern "C" fn ext_track_info_changed(plugin: *const clap_plugin) {
+        check_null_ptr!((), plugin, (*plugin).plugin_data);
+        let wrapper = &*((*plugin).plugin_data as *const Self);
+
+        wrapper.update_track_info();
     }
 
     unsafe extern "C" fn ext_voice_info_get(

@@ -252,6 +252,28 @@ pub trait Plugin: Default + Send + 'static {
     /// `initialize()` may be called more than once before `deactivate()` is called, for instance
     /// when restoring state while the plugin is still activate.
     fn deactivate(&mut self) {}
+
+    /// Called on the main thread when the host says what track the plugin is on: once soon after
+    /// the plugin is created, and again whenever that track is renamed or recoloured. This comes
+    /// from CLAP's `track-info` extension and VST3's `IInfoListener`; a host that supports
+    /// neither never calls it.
+    ///
+    /// Like the other main thread calls this takes the plugin's lock, so the audio thread waits
+    /// for it. Keep it short.
+    fn track_info_changed(&mut self, info: &TrackInfo) {}
+}
+
+/// What the host says about the track a plugin instance sits on. Every field is optional,
+/// because hosts fill in as much or as little of it as they like.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrackInfo {
+    /// The track's name, as the user sees it in the host.
+    pub name: Option<String>,
+    /// The track's colour as sRGB `[red, green, blue]`.
+    pub color: Option<[u8; 3]>,
+    /// The track's position among the host's tracks, counting from zero. VST3 only: CLAP's
+    /// `track-info` has no such field.
+    pub index: Option<i64>,
 }
 
 /// Indicates the current situation after the plugin has processed audio.

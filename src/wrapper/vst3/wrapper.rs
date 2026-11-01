@@ -10,6 +10,9 @@ use vst3_sys::base::{kInvalidArgument, kNoInterface, kResultFalse, kResultOk, tr
 use vst3_sys::base::{IBStream, IPluginBase};
 use vst3_sys::utils::SharedVstPtr;
 use vst3_sys::vst::{
+    kChannelColorKey, kChannelIndexKey, kChannelNameKey, IAttributeList, IInfoListener,
+};
+use vst3_sys::vst::{
     kNoParamId, kNoParentUnitId, kNoProgramListId, kRootUnitId, Event, EventTypes, IAudioProcessor,
     IComponent, IEditController, IEventList, IMidiMapping, INoteExpressionController,
     IParamValueQueue, IParameterChanges, IProcessContextRequirements, IUnitInfo,
@@ -45,7 +48,8 @@ use vst3_sys as vst3_com;
     IMidiMapping,
     INoteExpressionController,
     IProcessContextRequirements,
-    IUnitInfo
+    IUnitInfo,
+    IInfoListener
 ))]
 pub struct Wrapper<P: Vst3Plugin> {
     inner: Arc<WrapperInner<P>>,
@@ -1789,6 +1793,47 @@ impl<P: Vst3Plugin> IProcessContextRequirements for Wrapper<P> {
             | IProcessContextRequirementsFlags::kNeedTimeSignature
             | IProcessContextRequirementsFlags::kNeedTempo
             | IProcessContextRequirementsFlags::kNeedTransportState
+    }
+}
+
+impl<P: Vst3Plugin> IInfoListener for Wrapper<P> {
+    /// The host telling the plugin about the channel (track) it sits on. Called on the main
+    /// thread, when the plugin is created and whenever the channel changes.
+    unsafe fn set_channel_context_infos(&self, list: *mut c_void) -> tresult {
+        check_null_ptr!(list);
+        let Some(list) = vst3_sys::utils::VstPtr::<dyn IAttributeList>::shared(list as *mut *mut _)
+        else {
+            return kInvalidArgument;
+        };
+
+        // The size is in bytes. A name longer than this is cut, which is still a name.
+        let mut name_buf = [0 as TChar; 256];
+        let name = (list.get_string(
+            kChannelNameKey,
+            name_buf.as_mut_ptr(),
+            mem::size_of_val(&name_buf) as u32,
+        ) == kResultOk)
+            .then(|| {
+                if let Some(last) = name_buf.last_mut() {
+                    *last = 0;
+                }
+                U16CStr::from_ptr_str(name_buf.as_ptr() as *const u16).to_string_lossy()
+            });
+        // A `ColorSpec` in an int64: 0xAARRGGBB.
+        let mut color_spec: i64 = 0;
+        let color = (list.get_int(kChannelColorKey, &mut color_spec) == kResultOk).then(|| {
+            let c = color_spec as u32;
+            [(c >> 16) as u8, (c >> 8) as u8, c as u8]
+        });
+
+        let mut index: i64 = 0;
+        let index = (list.get_int(kChannelIndexKey, &mut index) == kResultOk).then_some(index);
+
+        let track_info = crate::plugin::TrackInfo { name, color, index };
+        nih_trace!("Host reports channel context {track_info:?}");
+        self.inner.plugin.lock().track_info_changed(&track_info);
+
+        kResultOk
     }
 }
 
